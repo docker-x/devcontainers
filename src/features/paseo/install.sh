@@ -128,10 +128,11 @@ PASEO_HOME_FALLBACK="${PASEO_HOME_FALLBACK:-$HOME/.paseo}"
 PASEO_HOME="${PASEO_HOME:-$PASEO_HOME_FALLBACK}"
 CONFIG_JSON="$PASEO_HOME/config.json"
 MARKER="$PASEO_HOME/.devcontainer-plugins-synced"
-ADD_OUT="$(mktemp)" || { log "could not create temp file; aborting sync."; exit 0; }
-trap 'rm -f "$ADD_OUT"' EXIT
 
 log() { echo "paseo-plugins-sync: $*" >&2; }
+
+ADD_OUT="$(mktemp)" || { log "could not create temp file; aborting sync."; exit 0; }
+trap 'rm -f "$ADD_OUT"' EXIT
 
 # Exit early when no plugins are configured — no point checking node or
 # waiting for the daemon if there is nothing to install.
@@ -173,23 +174,25 @@ enable_plugins_switch() {
     # Atomic write: write to a temp file then rename, so an interrupted write
     # or a concurrent daemon read does not corrupt config.json. Preserve the
     # original file mode (config.json is typically 0600) on the temp file.
-    if node -e '
+    # Exit codes: 0 = config changed, 2 = already enabled (no change), other = error.
+    node -e '
         const fs = require("fs");
         const p = process.argv[1];
         const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
-        if (cfg.pluginsEnabled === true) process.exit(0);
+        if (cfg.pluginsEnabled === true) process.exit(2);
         cfg.pluginsEnabled = true;
         const tmp = p + ".tmp." + process.pid;
         fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2) + "\n");
         try { fs.chmodSync(tmp, fs.statSync(p).mode); } catch {}
         fs.renameSync(tmp, p);
-    ' "$CONFIG_JSON" 2>/dev/null; then
-        log "enabled global plugin switch"
-    else
-        log "could not enable plugin switch (config.json left unchanged)"
-        return 0
-    fi
-    paseo reload --json >/dev/null 2>&1 || log "paseo reload failed (daemon may need a restart)"
+    ' "$CONFIG_JSON" 2>/dev/null
+    _rc=$?
+    case $_rc in
+        0) log "enabled global plugin switch"
+           paseo reload --json >/dev/null 2>&1 || log "paseo reload failed (daemon may need a restart)" ;;
+        2) log "plugin switch already enabled" ;;
+        *) log "could not enable plugin switch (config.json left unchanged)" ;;
+    esac
 }
 
 # Print installed plugin ids, one per line.
@@ -204,20 +207,32 @@ installed_ids() {
     '
 }
 
-# Record spec -> id in the marker file (idempotent replacement of any old entry).
-# Uses awk to filter by the first tab-separated field, so a spec that is a
-# substring of another spec does not cause both entries to be deleted.
-record_marker() {
-    local spec="$1" id="$2"
-    mkdir -p "$PASEO_HOME" 2>/dev/null || true
-    if [ -f "$MARKER" ]; then
-        awk -F '\t' -v s="$spec" '$1 != s { print }' "$MARKER" > "$MARKER.tmp" 2>/dev/null || true
-        mv "$MARKER.tmp" "$MARKER" 2>/dev/null || true
-    fi
-    printf '%s\t%s\n' "$spec" "$id" >> "$MARKER" 2>/dev/null || true
+# Redact credentials from a plugin spec for safe logging.
+# Replaces anything between :// and @ with *** (e.g. https://user:pass@host → https://***@host).
+redact_spec() {
+    printf '%s' "$1" | sed -E 's#://[^@]+@#://***@#g'
 }
 
-# Look up the recorded id for a spec, if any.
+# Hash a plugin spec for marker storage so credentials in URLs are not
+# persisted in the marker file.
+hash_spec() {
+    printf '%s' "$1" | sha256sum | cut -d' ' -f1
+}
+
+# Record spec-hash -> id in the marker file (idempotent replacement of any old entry).
+# Uses awk to filter by the first tab-separated field, so a hash that is a
+# substring of another hash does not cause both entries to be deleted.
+record_marker() {
+    local spec_hash="$1" id="$2"
+    mkdir -p "$PASEO_HOME" 2>/dev/null || true
+    if [ -f "$MARKER" ]; then
+        awk -F '\t' -v s="$spec_hash" '$1 != s { print }' "$MARKER" > "$MARKER.tmp" 2>/dev/null || true
+        mv "$MARKER.tmp" "$MARKER" 2>/dev/null || true
+    fi
+    printf '%s\t%s\n' "$spec_hash" "$id" >> "$MARKER" 2>/dev/null || true
+}
+
+# Look up the recorded id for a spec hash, if any.
 marker_id_for() {
     [ -f "$MARKER" ] || return 0
     awk -F '\t' -v s="$1" '$1 == s { print $2; exit }' "$MARKER"
@@ -230,11 +245,13 @@ IFS=',' read -ra SPECS <<< "$PASEO_PLUGINS"
 
 for spec in "${SPECS[@]}"; do
     [ -n "$spec" ] || continue
+    redacted="$(redact_spec "$spec")"
+    hashed="$(hash_spec "$spec")"
 
     # Skip if the marker has this spec and its id is still installed.
-    marker_id="$(marker_id_for "$spec")"
+    marker_id="$(marker_id_for "$hashed")"
     if [ -n "$marker_id" ] && printf '%s\n' "$(installed_ids)" | grep -Fxq "$marker_id"; then
-        log "already installed: $spec ($marker_id)"
+        log "already installed: $redacted ($marker_id)"
         continue
     fi
 
@@ -246,7 +263,7 @@ for spec in "${SPECS[@]}"; do
         *)     read -ra SPEC_ARGS <<< "$spec"; cmd=(paseo plugin add "${SPEC_ARGS[@]}") ;;
     esac
 
-    log "installing: $spec"
+    log "installing: $redacted"
     before="$(installed_ids)"
     if "${cmd[@]}" >"$ADD_OUT" 2>&1; then
         after="$(installed_ids)"
@@ -259,10 +276,10 @@ for spec in "${SPECS[@]}"; do
             fi
         done <<< "$after"
         if [ -n "$new_id" ]; then
-            record_marker "$spec" "$new_id"
-            log "installed: $spec ($new_id)"
+            record_marker "$hashed" "$new_id"
+            log "installed: $redacted ($new_id)"
         else
-            log "installed: $spec (id could not be determined)"
+            log "installed: $redacted (id could not be determined)"
         fi
     else
         # Tolerate "already configured" (e.g. marker missing but plugin present).
@@ -271,13 +288,13 @@ for spec in "${SPECS[@]}"; do
         if grep -q "already configured" "$ADD_OUT" 2>/dev/null; then
             existing_id="$(grep -o 'Plugin ID "[^"]*"' "$ADD_OUT" 2>/dev/null | head -1 | sed 's/Plugin ID "//;s/"//')"
             if [ -n "$existing_id" ]; then
-                record_marker "$spec" "$existing_id"
-                log "already configured: $spec ($existing_id)"
+                record_marker "$hashed" "$existing_id"
+                log "already configured: $redacted ($existing_id)"
             else
-                log "already configured: $spec (skipped)"
+                log "already configured: $redacted (skipped)"
             fi
         else
-            log "failed: $spec"
+            log "failed: $redacted"
             sed 's/^/  /' "$ADD_OUT" >&2 2>/dev/null || true
         fi
     fi
