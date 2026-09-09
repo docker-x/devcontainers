@@ -1,6 +1,6 @@
 {
   "id": "paseo",
-  "version": "1.0.5",
+  "version": "1.1.0",
   "name": "Paseo CLI",
   "description": "Install Paseo CLI - local-first AI development environment with daemon, web UI, and agent orchestration.",
   "documentationURL": "https://getpaseo.sh",
@@ -16,6 +16,16 @@
       "type": "string",
       "default": "latest",
       "description": "Version of Paseo CLI to install"
+    },
+    "plugins": {
+      "type": "string",
+      "default": "",
+      "description": "Comma-separated list of Paseo plugins to install on the daemon at runtime. Each entry is passed to `paseo plugin add` (Git sources like `owner/repository`, `owner/monorepo:plugins/x`, `https://gitlab.com/group/repo.git --ref main`) or `paseo plugin install` (local paths starting with `/` or `.`). Install requires a running daemon; call the generated `/usr/local/bin/paseo-plugins-sync` from postStartCommand."
+    },
+    "enablePlugins": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable the daemon-wide `pluginsEnabled` switch in config.json so configured plugins run. Setting `plugins` implies consent; set to `false` to leave the switch untouched."
     }
   },
   "installsAfter": [
