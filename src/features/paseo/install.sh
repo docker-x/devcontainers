@@ -128,7 +128,7 @@ PASEO_HOME_FALLBACK="${PASEO_HOME_FALLBACK:-$HOME/.paseo}"
 PASEO_HOME="${PASEO_HOME:-$PASEO_HOME_FALLBACK}"
 CONFIG_JSON="$PASEO_HOME/config.json"
 MARKER="$PASEO_HOME/.devcontainer-plugins-synced"
-ADD_OUT="$(mktemp)"
+ADD_OUT="$(mktemp)" || { log "could not create temp file; aborting sync."; exit 0; }
 trap 'rm -f "$ADD_OUT"' EXIT
 
 log() { echo "paseo-plugins-sync: $*" >&2; }
@@ -238,14 +238,12 @@ for spec in "${SPECS[@]}"; do
         continue
     fi
 
-    # Split the spec into words so flags (e.g. "--ref main") become separate
-    # argv elements. Local paths (absolute or any dot-prefixed relative path,
-    # including "../" and ".hidden") use `install`; everything else is a Git
-    # source for `add`.
-    read -ra SPEC_ARGS <<< "$spec"
-    case "${SPEC_ARGS[0]}" in
-        /*|.*) cmd=(paseo plugin install "${SPEC_ARGS[@]}") ;;
-        *)     cmd=(paseo plugin add "${SPEC_ARGS[@]}") ;;
+    # Local paths (absolute or any dot-prefixed relative) are passed as a
+    # single argument to preserve spaces in the path. Git sources are split
+    # into words so flags like "--ref main" become separate argv elements.
+    case "$spec" in
+        /*|.*) cmd=(paseo plugin install "$spec") ;;
+        *)     read -ra SPEC_ARGS <<< "$spec"; cmd=(paseo plugin add "${SPEC_ARGS[@]}") ;;
     esac
 
     log "installing: $spec"
