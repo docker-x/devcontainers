@@ -16,26 +16,23 @@ SHARE_CONFIG="${SHARECONFIG:-false}"
 
 echo "herdr: installing Herdr (version: ${VERSION})..."
 
-# --- Install curl if not present ---
-if ! command -v curl >/dev/null 2>&1; then
-    apt-get update -y && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
-fi
-
-# --- Resolve version to a release tag ---
-if [[ "$VERSION" == "latest" || -z "$VERSION" ]]; then
-    # Fetch the latest release manifest from herdr.dev
-    MANIFEST="$(curl -fsSL --retry 3 --connect-timeout 10 --max-time 20 https://herdr.dev/latest.json)"
-    VERSION="$(printf '%s\n' "$MANIFEST" | awk -F '"' '/"version"/ { print $4; exit }')"
-    if [[ -z "$VERSION" ]]; then
-        echo "Error: could not determine latest Herdr version from manifest" >&2
+# --- Install curl and jq if not present (one consolidated apt pass) ---
+# jq is the manifest parser — installsAfter only orders features, it does
+# not guarantee node is installed, so a parser this script can install
+# itself is required.
+PKG_MISSING=()
+command -v curl >/dev/null 2>&1 || PKG_MISSING+=(curl)
+command -v jq   >/dev/null 2>&1 || PKG_MISSING+=(jq)
+if ((${#PKG_MISSING[@]})); then
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo "Error: ${PKG_MISSING[*]} required but apt-get is unavailable on this base image" >&2
         exit 1
     fi
-    echo "herdr: resolved latest version to v${VERSION}"
-else
-    # Strip leading 'v' if present, then re-add for the tag
-    VERSION="${VERSION#v}"
+    apt-get update -y || { echo "Error: apt-get update failed" >&2; exit 1; }
+    apt-get install -y "${PKG_MISSING[@]}" \
+        || { echo "Error: failed to install ${PKG_MISSING[*]} via apt-get" >&2; exit 1; }
+    rm -rf /var/lib/apt/lists/*
 fi
-RELEASE_TAG="v${VERSION}"
 
 # --- Select architecture-appropriate release asset ---
 HERDR_ARCH="$(uname -m)"
@@ -45,75 +42,66 @@ case "$HERDR_ARCH" in
     *)              echo "herdr: unsupported architecture $HERDR_ARCH for pre-built binary" >&2; exit 1 ;;
 esac
 
-# --- Build download URL and fetch SHA-256 from the manifest ---
+# --- Resolve version, asset URL and SHA-256 from ONE manifest fetch ---
+# latest.json carries every published release under releases.<v>
+# (assets + sha256) — a second endpoint is not needed and the legacy
+# releases.json fallback only ever served the site's HTML anyway.
+# jq replaces awk field math that breaks on minified JSON or reordered
+# keys. --proto/--proto-redir '=https' block HTTP redirect hijacking
+# (CWE-494) — --proto alone would not cover redirect targets.
+MANIFEST="$(curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 \
+    --connect-timeout 10 --max-time 20 https://herdr.dev/latest.json)" \
+    || { echo "Error: failed to fetch Herdr release manifest" >&2; exit 1; }
+
+# The manifest supplies version + checksum only — the download URL is
+# constructed from the pinned GitHub release origin below so an altered
+# manifest cannot redirect the fetch to an arbitrary host.
+RESOLVED="$(jq -r --arg v "$VERSION" --arg t "$HERDR_TARGET" '
+    (if $v == "latest" or $v == "" then .version else ($v | sub("^v"; "")) end) as $ver
+    | .releases[$ver] as $rel
+    | if ($rel and $rel.sha256[$t] and $rel.assets[$t])
+      then [$ver, $rel.sha256[$t]] | join("\t")
+      else error("release \($ver) has no \($t) asset/checksum in the manifest")
+      end' <<< "$MANIFEST")" \
+    || { echo "Error: could not resolve Herdr ${VERSION} for ${HERDR_TARGET}" >&2; exit 1; }
+IFS=$'\t' read -r VERSION HERDR_SHA256 <<< "$RESOLVED"
+
+# Fail closed: a missing or malformed checksum means no install at all —
+# an unverified binary is never acceptable (CWE-494).
+if [[ -z "$VERSION" || -z "$HERDR_SHA256" || ${#HERDR_SHA256} -ne 64 ]]; then
+    echo "Error: could not resolve SHA-256 for Herdr ${VERSION} (${HERDR_TARGET}) — refusing to install unverified" >&2
+    exit 1
+fi
+RELEASE_TAG="v${VERSION}"
 HERDR_URL="https://github.com/herdrdev/herdr/releases/download/${RELEASE_TAG}/herdr-${HERDR_TARGET}"
-
-# Fetch SHA-256 from the release manifest (authoritative source)
-MANIFEST="$(curl -fsSL --retry 3 --connect-timeout 10 --max-time 20 https://herdr.dev/latest.json)"
-HERDR_SHA256="$(printf '%s\n' "$MANIFEST" | awk -v target="\"${HERDR_TARGET}\"" '
-    /"sha256"/ { in_sha256 = 1; next }
-    in_sha256 && /}/ { exit }
-    in_sha256 && index($0, target) {
-        sub(/^.*:[[:space:]]*"/, "")
-        sub(/".*$/, "")
-        print
-        exit
-    }
-')"
-
-# If the manifest didn't have the SHA (e.g. version mismatch for non-latest),
-# fall back to fetching the specific release manifest
-if [[ -z "$HERDR_SHA256" ]] || [[ ${#HERDR_SHA256} -ne 64 ]]; then
-    echo "herdr: SHA-256 not in latest manifest, fetching release-specific checksums..."
-    # Try the releases-specific manifest endpoint
-    MANIFEST="$(curl -fsSL --retry 3 --connect-timeout 10 --max-time 20 "https://herdr.dev/releases.json")"
-    HERDR_SHA256="$(printf '%s\n' "$MANIFEST" | awk -v ver="\"${VERSION}\"" -v target="\"${HERDR_TARGET}\"" '
-        $0 ~ "\""$ver"\"" { in_ver = 1 }
-        in_ver && /"sha256"/ { in_sha256 = 1; next }
-        in_sha256 && /}/ { in_sha256 = 0 }
-        in_sha256 && index($0, target) {
-            sub(/^.*:[[:space:]]*"/, "")
-            sub(/".*$/, "")
-            print
-            exit
-        }
-    ')"
-fi
-
-if [[ -z "$HERDR_SHA256" ]] || [[ ${#HERDR_SHA256} -ne 64 ]]; then
-    echo "Error: could not find SHA-256 checksum for ${HERDR_TARGET} in release ${RELEASE_TAG}" >&2
-    echo "herdr: continuing without checksum verification (unpinned fallback)"
-    HERDR_SHA256=""
-fi
+echo "herdr: resolved ${RELEASE_TAG} for ${HERDR_TARGET}"
 
 # --- Download to a mktemp directory (CWE-377) ---
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 echo "herdr: downloading ${RELEASE_TAG} for ${HERDR_TARGET}..."
-if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 120 "$HERDR_URL" -o "${TMPDIR}/herdr"; then
+if ! curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --connect-timeout 10 --max-time 120 "$HERDR_URL" -o "${TMPDIR}/herdr"; then
     echo "Error: failed to download Herdr binary from ${HERDR_URL}" >&2
     exit 1
 fi
 
-# --- Verify SHA-256 (CWE-494) ---
-if [[ -n "$HERDR_SHA256" ]]; then
-    if command -v sha256sum >/dev/null 2>&1; then
-        ACTUAL_SHA256="$(sha256sum < "${TMPDIR}/herdr" | awk '{ print $1 }')"
-    elif command -v shasum >/dev/null 2>&1; then
-        ACTUAL_SHA256="$(shasum -a 256 < "${TMPDIR}/herdr" | awk '{ print $1 }')"
-    elif command -v openssl >/dev/null 2>&1; then
-        ACTUAL_SHA256="$(openssl dgst -sha256 < "${TMPDIR}/herdr" | awk '{ print $NF }')"
-    else
-        echo "Warning: no SHA-256 tool available; skipping verification" >&2
-        ACTUAL_SHA256="$HERDR_SHA256"  # skip check
-    fi
-    if [[ "$ACTUAL_SHA256" != "$HERDR_SHA256" ]]; then
-        echo "Error: Herdr checksum mismatch (expected ${HERDR_SHA256}, got ${ACTUAL_SHA256})" >&2
-        exit 1
-    fi
-    echo "herdr: SHA-256 verified"
+# --- Verify SHA-256 (CWE-494) — mandatory, never skipped ---
+if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL_SHA256="$(sha256sum < "${TMPDIR}/herdr" | awk '{ print $1 }')"
+elif command -v shasum >/dev/null 2>&1; then
+    ACTUAL_SHA256="$(shasum -a 256 < "${TMPDIR}/herdr" | awk '{ print $1 }')"
+elif command -v openssl >/dev/null 2>&1; then
+    ACTUAL_SHA256="$(openssl dgst -sha256 < "${TMPDIR}/herdr" | awk '{ print $NF }')"
+else
+    echo "Error: no SHA-256 tool available — cannot verify the download" >&2
+    exit 1
 fi
+if [[ "$ACTUAL_SHA256" != "$HERDR_SHA256" ]]; then
+    echo "Error: Herdr checksum mismatch (expected ${HERDR_SHA256}, got ${ACTUAL_SHA256})" >&2
+    exit 1
+fi
+echo "herdr: SHA-256 verified"
 
 # --- Install the binary to /usr/local/bin and user home ---
 install -m 755 "${TMPDIR}/herdr" /usr/local/bin/herdr
