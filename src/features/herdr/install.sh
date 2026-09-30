@@ -16,9 +16,15 @@ SHARE_CONFIG="${SHARECONFIG:-false}"
 
 echo "herdr: installing Herdr (version: ${VERSION})..."
 
-# --- Install curl if not present ---
-if ! command -v curl >/dev/null 2>&1; then
-    apt-get update -y && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+# --- Install curl and jq if not present (one consolidated apt pass) ---
+# jq is the manifest parser — installsAfter only orders features, it does
+# not guarantee node is installed, so a parser this script can install
+# itself is required.
+PKG_MISSING=""
+command -v curl >/dev/null 2>&1 || PKG_MISSING="curl"
+command -v jq   >/dev/null 2>&1 || PKG_MISSING="${PKG_MISSING:+$PKG_MISSING }jq"
+if [[ -n "$PKG_MISSING" ]]; then
+    apt-get update -y && apt-get install -y $PKG_MISSING && rm -rf /var/lib/apt/lists/*
 fi
 
 # --- Select architecture-appropriate release asset ---
@@ -33,31 +39,27 @@ esac
 # latest.json carries every published release under releases.<v>
 # (assets + sha256) — a second endpoint is not needed and the legacy
 # releases.json fallback only ever served the site's HTML anyway.
-# Node is guaranteed by installsAfter (devcontainers/features/node), so
-# parse real JSON instead of awk field math that breaks on minified
-# output or reordered keys.
-# --proto '=https' blocks HTTP redirect hijacking (CWE-494).
-MANIFEST="$(curl -fsSL --proto '=https' --retry 3 --connect-timeout 10 --max-time 20 https://herdr.dev/latest.json)" \
+# jq replaces awk field math that breaks on minified JSON or reordered
+# keys. --proto/--proto-redir '=https' block HTTP redirect hijacking
+# (CWE-494) — --proto alone would not cover redirect targets.
+MANIFEST="$(curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 \
+    --connect-timeout 10 --max-time 20 https://herdr.dev/latest.json)" \
     || { echo "Error: failed to fetch Herdr release manifest" >&2; exit 1; }
 
-IFS=$'\t' read -r VERSION HERDR_URL HERDR_SHA256 < <(node -e '
-    const m = JSON.parse(require("fs").readFileSync(0, "utf8"));
-    const want = (process.argv[1] || "latest").replace(/^v/, "");
-    const target = process.argv[2];
-    const ver = want === "latest" ? m.version : want;
-    const rel = m.releases && m.releases[ver];
-    const sha = rel && rel.sha256 && rel.sha256[target];
-    const url = rel && rel.assets && rel.assets[target];
-    if (rel && sha && url) {
-        console.log([ver, url, sha].join("\t"));
-    } else {
-        console.error(`herdr: release ${ver} has no ${target} asset/checksum in the manifest`);
-    }
-' "$VERSION" "$HERDR_TARGET" <<< "$MANIFEST")
+RESOLVED="$(jq -r --arg v "$VERSION" --arg t "$HERDR_TARGET" '
+    ($v | sub("^v"; "")) as $want
+    | (if $want == "latest" or $want == "" then .version else $want end) as $ver
+    | .releases[$ver] as $rel
+    | if ($rel and $rel.sha256[$t] and $rel.assets[$t])
+      then [$ver, $rel.assets[$t], $rel.sha256[$t]] | join("\t")
+      else error("release \($ver) has no \($t) asset/checksum in the manifest")
+      end' <<< "$MANIFEST")" \
+    || { echo "Error: could not resolve Herdr ${VERSION} for ${HERDR_TARGET}" >&2; exit 1; }
+IFS=$'\t' read -r VERSION HERDR_URL HERDR_SHA256 <<< "$RESOLVED"
 
 # Fail closed: a missing or malformed checksum means no install at all —
 # an unverified binary is never acceptable (CWE-494).
-if [[ -z "$HERDR_SHA256" || ${#HERDR_SHA256} -ne 64 || -z "$HERDR_URL" ]]; then
+if [[ -z "$VERSION" || -z "$HERDR_SHA256" || ${#HERDR_SHA256} -ne 64 || -z "$HERDR_URL" ]]; then
     echo "Error: could not resolve SHA-256 for Herdr ${VERSION} (${HERDR_TARGET}) — refusing to install unverified" >&2
     exit 1
 fi
@@ -69,7 +71,7 @@ TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 echo "herdr: downloading ${RELEASE_TAG} for ${HERDR_TARGET}..."
-if ! curl -fsSL --proto '=https' --retry 3 --connect-timeout 10 --max-time 120 "$HERDR_URL" -o "${TMPDIR}/herdr"; then
+if ! curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --connect-timeout 10 --max-time 120 "$HERDR_URL" -o "${TMPDIR}/herdr"; then
     echo "Error: failed to download Herdr binary from ${HERDR_URL}" >&2
     exit 1
 fi
