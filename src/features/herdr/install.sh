@@ -28,8 +28,10 @@ if ((${#PKG_MISSING[@]})); then
         echo "Error: ${PKG_MISSING[*]} required but apt-get is unavailable on this base image" >&2
         exit 1
     fi
-    apt-get update -y && apt-get install -y "${PKG_MISSING[@]}" && rm -rf /var/lib/apt/lists/* \
+    apt-get update -y || { echo "Error: apt-get update failed" >&2; exit 1; }
+    apt-get install -y "${PKG_MISSING[@]}" \
         || { echo "Error: failed to install ${PKG_MISSING[*]} via apt-get" >&2; exit 1; }
+    rm -rf /var/lib/apt/lists/*
 fi
 
 # --- Select architecture-appropriate release asset ---
