@@ -20,11 +20,11 @@ echo "herdr: installing Herdr (version: ${VERSION})..."
 # jq is the manifest parser — installsAfter only orders features, it does
 # not guarantee node is installed, so a parser this script can install
 # itself is required.
-PKG_MISSING=""
-command -v curl >/dev/null 2>&1 || PKG_MISSING="curl"
-command -v jq   >/dev/null 2>&1 || PKG_MISSING="${PKG_MISSING:+$PKG_MISSING }jq"
-if [[ -n "$PKG_MISSING" ]]; then
-    apt-get update -y && apt-get install -y $PKG_MISSING && rm -rf /var/lib/apt/lists/*
+PKG_MISSING=()
+command -v curl >/dev/null 2>&1 || PKG_MISSING+=(curl)
+command -v jq   >/dev/null 2>&1 || PKG_MISSING+=(jq)
+if ((${#PKG_MISSING[@]})); then
+    apt-get update -y && apt-get install -y "${PKG_MISSING[@]}" && rm -rf /var/lib/apt/lists/*
 fi
 
 # --- Select architecture-appropriate release asset ---
