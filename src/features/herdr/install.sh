@@ -46,24 +46,28 @@ MANIFEST="$(curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 \
     --connect-timeout 10 --max-time 20 https://herdr.dev/latest.json)" \
     || { echo "Error: failed to fetch Herdr release manifest" >&2; exit 1; }
 
+# The manifest supplies version + checksum only — the download URL is
+# constructed from the pinned GitHub release origin below so an altered
+# manifest cannot redirect the fetch to an arbitrary host.
 RESOLVED="$(jq -r --arg v "$VERSION" --arg t "$HERDR_TARGET" '
     ($v | sub("^v"; "")) as $want
     | (if $want == "latest" or $want == "" then .version else $want end) as $ver
     | .releases[$ver] as $rel
-    | if ($rel and $rel.sha256[$t] and $rel.assets[$t])
-      then [$ver, $rel.assets[$t], $rel.sha256[$t]] | join("\t")
-      else error("release \($ver) has no \($t) asset/checksum in the manifest")
+    | if ($rel and $rel.sha256[$t])
+      then [$ver, $rel.sha256[$t]] | join("\t")
+      else error("release \($ver) has no \($t) checksum in the manifest")
       end' <<< "$MANIFEST")" \
     || { echo "Error: could not resolve Herdr ${VERSION} for ${HERDR_TARGET}" >&2; exit 1; }
-IFS=$'\t' read -r VERSION HERDR_URL HERDR_SHA256 <<< "$RESOLVED"
+IFS=$'\t' read -r VERSION HERDR_SHA256 <<< "$RESOLVED"
 
 # Fail closed: a missing or malformed checksum means no install at all —
 # an unverified binary is never acceptable (CWE-494).
-if [[ -z "$VERSION" || -z "$HERDR_SHA256" || ${#HERDR_SHA256} -ne 64 || -z "$HERDR_URL" ]]; then
+if [[ -z "$VERSION" || -z "$HERDR_SHA256" || ${#HERDR_SHA256} -ne 64 ]]; then
     echo "Error: could not resolve SHA-256 for Herdr ${VERSION} (${HERDR_TARGET}) — refusing to install unverified" >&2
     exit 1
 fi
 RELEASE_TAG="v${VERSION}"
+HERDR_URL="https://github.com/herdrdev/herdr/releases/download/${RELEASE_TAG}/herdr-${HERDR_TARGET}"
 echo "herdr: resolved ${RELEASE_TAG} for ${HERDR_TARGET}"
 
 # --- Download to a mktemp directory (CWE-377) ---
