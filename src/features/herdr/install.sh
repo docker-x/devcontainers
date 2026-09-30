@@ -24,7 +24,12 @@ PKG_MISSING=()
 command -v curl >/dev/null 2>&1 || PKG_MISSING+=(curl)
 command -v jq   >/dev/null 2>&1 || PKG_MISSING+=(jq)
 if ((${#PKG_MISSING[@]})); then
-    apt-get update -y && apt-get install -y "${PKG_MISSING[@]}" && rm -rf /var/lib/apt/lists/*
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo "Error: ${PKG_MISSING[*]} required but apt-get is unavailable on this base image" >&2
+        exit 1
+    fi
+    apt-get update -y && apt-get install -y "${PKG_MISSING[@]}" && rm -rf /var/lib/apt/lists/* \
+        || { echo "Error: failed to install ${PKG_MISSING[*]} via apt-get" >&2; exit 1; }
 fi
 
 # --- Select architecture-appropriate release asset ---
@@ -50,12 +55,11 @@ MANIFEST="$(curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 \
 # constructed from the pinned GitHub release origin below so an altered
 # manifest cannot redirect the fetch to an arbitrary host.
 RESOLVED="$(jq -r --arg v "$VERSION" --arg t "$HERDR_TARGET" '
-    ($v | sub("^v"; "")) as $want
-    | (if $want == "latest" or $want == "" then .version else $want end) as $ver
+    (if $v == "latest" or $v == "" then .version else ($v | sub("^v"; "")) end) as $ver
     | .releases[$ver] as $rel
-    | if ($rel and $rel.sha256[$t])
+    | if ($rel and $rel.sha256[$t] and $rel.assets[$t])
       then [$ver, $rel.sha256[$t]] | join("\t")
-      else error("release \($ver) has no \($t) checksum in the manifest")
+      else error("release \($ver) has no \($t) asset/checksum in the manifest")
       end' <<< "$MANIFEST")" \
     || { echo "Error: could not resolve Herdr ${VERSION} for ${HERDR_TARGET}" >&2; exit 1; }
 IFS=$'\t' read -r VERSION HERDR_SHA256 <<< "$RESOLVED"
